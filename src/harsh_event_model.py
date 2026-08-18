@@ -432,3 +432,265 @@ class RealtimeHarshEventDetector:
             "confidence": confidence,
             "probabilities": proba_dict,
         }
+
+
+# ==============================================================================
+# PyTorch 1D-CNN Sequence Harsh Event Detector
+# ==============================================================================
+
+import torch
+import torch.nn as nn
+
+class TimeSeriesCNN1D(nn.Module):
+    def __init__(self, in_features: int, n_classes: int) -> None:
+        super().__init__()
+        self.conv = nn.Sequential(
+            # Layer 1
+            nn.Conv1d(in_channels=in_features, out_channels=64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
+            # Layer 2
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            
+            # Layer 3
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            
+            # Layer 4
+            nn.Conv1d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(128, n_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input shape: [B, T, F] -> Transpose to [B, F, T]
+        x = x.transpose(1, 2)
+        x = self.conv(x)
+        # Global average pooling along temporal dimension (dim 2)
+        pooled = x.mean(dim=2)
+        return self.head(pooled)
+
+
+class RealtimeCNNHarshEventDetector:
+    def __init__(
+        self,
+        model_bundle_path: str | Path,
+        min_confidence: float = 0.35,
+        consecutive_hits: int = 2,
+        heuristic_enabled: bool = True,
+        accel_threshold: float = 2.0,
+        brake_threshold: float = -2.0,
+        turn_threshold: float = 40.0,
+        lane_change_threshold: float = 2.0,
+        invert_gyro_z: bool = False,
+        invert_acc_y: bool = False,
+    ) -> None:
+        self.bundle = torch.load(model_bundle_path, map_location=torch.device("cpu"))
+        
+        self.in_features = int(self.bundle["in_features"])
+        self.n_classes = int(self.bundle["n_classes"])
+        
+        self.model = TimeSeriesCNN1D(self.in_features, self.n_classes)
+        self.model.load_state_dict(self.bundle["model_state_dict"])
+        self.model.eval()
+        
+        self.scaler = self.bundle["scaler"]
+        self.label_encoder_classes = self.bundle["label_encoder_classes"]
+        self.feature_cols_stream = list(self.bundle["feature_cols_stream"])
+        self.window_size = int(self.bundle["window_size"])
+        self.step_size = int(self.bundle["step_size"])
+        
+        self.min_confidence = float(min_confidence)
+        self.consecutive_hits = int(consecutive_hits)
+        self.heuristic_enabled = bool(heuristic_enabled)
+        
+        self.accel_threshold = float(accel_threshold)
+        self.brake_threshold = float(brake_threshold)
+        self.turn_threshold = float(turn_threshold)
+        # Convert turn threshold from degrees/sec to radians/sec internally for raw IMU matching
+        self.turn_threshold_rad = np.deg2rad(self.turn_threshold)
+        self.lane_change_threshold = float(lane_change_threshold)
+        self.invert_gyro_z = bool(invert_gyro_z)
+        self.invert_acc_y = bool(invert_acc_y)
+        
+        # Buffer needs window_size + 10 elements to compute rolling features without edge effects
+        self.history_size = self.window_size + 10
+        self.buffer: Deque[Dict[str, float]] = deque(maxlen=self.history_size)
+        self._tick = 0
+        self._active_label: Optional[str] = None
+        self._candidate_label: Optional[str] = None
+        self._candidate_hits = 0
+
+    def _smooth_label(self, raw_label: str) -> str:
+        if self._active_label is None:
+            if raw_label == "safe":
+                return "safe"
+            self._candidate_label = raw_label
+            self._candidate_hits = 1
+            if self._candidate_hits >= self.consecutive_hits:
+                self._active_label = raw_label
+            return self._active_label or "safe"
+
+        if raw_label == self._active_label:
+            self._candidate_label = None
+            self._candidate_hits = 0
+            return self._active_label
+
+        if raw_label == self._candidate_label:
+            self._candidate_hits += 1
+        else:
+            self._candidate_label = raw_label
+            self._candidate_hits = 1
+
+        if self._candidate_hits >= self.consecutive_hits:
+            self._active_label = raw_label if raw_label != "safe" else None
+            self._candidate_label = None
+            self._candidate_hits = 0
+
+        return self._active_label or "safe"
+
+    def _build_sequence_tensor(self) -> torch.Tensor:
+        df = pd.DataFrame(list(self.buffer))
+        
+        # Compute engineered features
+        df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
+        df['gyro_mag'] = np.sqrt(df['gyro_x']**2 + df['gyro_y']**2 + df['gyro_z']**2)
+        df['mag_mag'] = np.sqrt(df['mag_x']**2 + df['mag_y']**2 + df['mag_z']**2)
+        
+        for axis in ['acc_x', 'acc_y', 'acc_z']:
+            df[f'{axis}_jerk'] = df[axis].diff().fillna(0.0)
+            
+        df['lat_long_ratio'] = df['acc_y'].abs() / (df['acc_x'].abs() + 1e-6)
+        df['acc_x_abs'] = df['acc_x'].abs()
+        df['acc_y_abs'] = df['acc_y'].abs()
+        df['gyro_z_abs'] = df['gyro_z'].abs()
+        
+        df['acc_lat_energy'] = df['acc_y'] ** 2
+        df['acc_long_energy'] = df['acc_x'] ** 2
+        df['gyro_yaw_energy'] = df['gyro_z'] ** 2
+        
+        df['lat_long_energy_ratio'] = df['acc_y_abs'] / (df['acc_x_abs'] + 1e-6)
+        df['turn_vs_lateral'] = df['gyro_z_abs'] / (df['acc_y_abs'] + 1e-6)
+        df['yaw_acc_corr'] = df['gyro_z'] * df['acc_y']
+        
+        df['gyro_z_diff'] = df['gyro_z'].diff().fillna(0.0)
+        df['acc_y_diff'] = df['acc_y'].diff().fillna(0.0)
+        
+        df['gyro_z_roll_std5'] = df['gyro_z'].rolling(5, min_periods=1).std().fillna(0.0)
+        df['acc_y_roll_std5'] = df['acc_y'].rolling(5, min_periods=1).std().fillna(0.0)
+        df['acc_y_roll_mean5'] = df['acc_y'].rolling(5, min_periods=1).mean().fillna(0.0)
+        
+        df['gyro_z_sign_change'] = (df['gyro_z'].shift(1) * df['gyro_z'] < 0).astype(int).fillna(0)
+        
+        df['gyro_x_abs'] = df['gyro_x'].abs()
+        df['gyro_y_abs'] = df['gyro_y'].abs()
+        df['gyro_x_energy'] = df['gyro_x'] ** 2
+        df['gyro_y_energy'] = df['gyro_y'] ** 2
+        df['gyro_roll_pitch_mag'] = np.sqrt(df['gyro_x']**2 + df['gyro_y']**2)
+        df['gyro_total_mag'] = np.sqrt(df['gyro_x']**2 + df['gyro_y']**2 + df['gyro_z']**2)
+        df['yaw_vs_roll_pitch'] = df['gyro_z_abs'] / (df['gyro_roll_pitch_mag'] + 1e-6)
+        df['gyro_x_roll_std5'] = df['gyro_x'].rolling(5, min_periods=1).std().fillna(0.0)
+        df['gyro_y_roll_std5'] = df['gyro_y'].rolling(5, min_periods=1).std().fillna(0.0)
+        
+        # Slices the last window_size (25) steps of computed features
+        df_sliced = df.iloc[-self.window_size:]
+        values = df_sliced[self.feature_cols_stream].to_numpy(dtype=np.float32)
+        
+        # Scale values using StandardScaler
+        scaled_values = self.scaler.transform(values)
+        
+        # Convert to Tensor [1, window_size, 40]
+        tensor = torch.tensor(scaled_values, dtype=torch.float32).unsqueeze(0)
+        return tensor
+
+    def update(self, sample: Dict[str, float]) -> Optional[Dict[str, object]]:
+        cleaned = {}
+        for col in IMU_COLUMNS:
+            if col not in sample:
+                raise KeyError(f"Missing IMU column in sample: {col}")
+            cleaned[col] = float(sample[col])
+
+        if self.invert_gyro_z:
+            cleaned["gyro_z"] = -cleaned["gyro_z"]
+        if self.invert_acc_y:
+            cleaned["acc_y"] = -cleaned["acc_y"]
+
+        self.buffer.append(cleaned)
+        self._tick += 1
+
+        if len(self.buffer) < self.history_size:
+            return {
+                "ready": False,
+                "reason": "warming_up",
+                "buffer_size": len(self.buffer),
+                "required": self.history_size,
+            }
+
+        if (self._tick % self.step_size) != 0:
+            return None
+
+        # Build sequence tensor and run PyTorch CNN model
+        tensor = self._build_sequence_tensor()
+        with torch.no_grad():
+            logits = self.model(tensor)
+            probabilities = torch.softmax(logits, dim=1)[0].numpy()
+            
+        pred_idx = int(np.argmax(probabilities))
+        confidence = float(probabilities[pred_idx])
+        raw_label = str(self.label_encoder_classes[pred_idx])
+
+        if confidence < self.min_confidence:
+            raw_label = "safe"
+
+        # Heuristic fallback for sharper events when ml model is uncertain
+        if self.heuristic_enabled and raw_label == "safe" and self.buffer:
+            last = self.buffer[-1]
+            acc_x = last.get("acc_x", 0.0)
+            acc_y = last.get("acc_y", 0.0)
+            gyro_z = last.get("gyro_z", 0.0)
+
+            if acc_x >= self.accel_threshold:
+                raw_label = "sudden_acceleration"
+                confidence = max(confidence, 0.50)
+            elif acc_x <= self.brake_threshold:
+                raw_label = "sudden_braking"
+                confidence = max(confidence, 0.50)
+            elif gyro_z >= self.turn_threshold_rad:
+                raw_label = "harsh_right_turn"
+                confidence = max(confidence, 0.50)
+            elif gyro_z <= -self.turn_threshold_rad:
+                raw_label = "harsh_left_turn"
+                confidence = max(confidence, 0.50)
+            elif acc_y >= self.lane_change_threshold:
+                raw_label = "harsh_right_lane_change"
+                confidence = max(confidence, 0.50)
+            elif acc_y <= -self.lane_change_threshold:
+                raw_label = "harsh_left_lane_change"
+                confidence = max(confidence, 0.50)
+
+        smoothed_label = self._smooth_label(raw_label)
+
+        proba_dict = {cls: float(prob) for cls, prob in zip(self.label_encoder_classes, probabilities)}
+
+        return {
+            "ready": True,
+            "raw_prediction": raw_label,
+            "prediction": smoothed_label,
+            "confidence": confidence,
+            "probabilities": proba_dict,
+        }
