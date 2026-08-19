@@ -23,5 +23,21 @@ export PYTHONPATH=$PYTHONPATH:/home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/carl
 
 Terminal 3 (CNN Real-time Detector):
 ```bash
-export PYTHONPATH=$PYTHONPATH:/home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/carla/dist/carla-0.9.13-py3.7-linux-x86_64.egg && python3 src/run_carla_realtime_cnn.py --model-path artifacts/harsh_event_cnn_bundle.pth --mag-mode virtual3d --mag-field-strength 100 --mag-declination-deg 0 --mag-inclination-deg 60 --heuristic --print-safe --min-confidence 0.35 --consecutive-hits 2 --sensor-tick 0.02 --invert-gyro-z --invert-acc-y
+export PYTHONPATH=$PYTHONPATH:/home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/carla/dist/carla-0.9.13-py3.7-linux-x86_64.egg && python3 src/run_carla_realtime_cnn.py \
+  --model-path artifacts/harsh_event_cnn_bundle.pth \
+  --mag-mode virtual3d \
+  --mag-field-strength 100 \
+  --mag-declination-deg 0 \
+  --mag-inclination-deg 60 \
+  --heuristic \
+  --print-safe \
+  --min-confidence 0.35 \
+  --consecutive-hits 1 \
+  --turn-threshold 20 \
+  --sensor-tick 0.05
 ```
+
+> **Note:** After retraining the CNN notebook (`notebooks/harsh_event_detection_cnn.ipynb`),
+> the model file at `artifacts/harsh_event_cnn_bundle.pth` will include the new
+> sustained-yaw features and be trained with turns in the test set.
+> Use `--consecutive-hits 2` if you see too many false positives in normal driving.

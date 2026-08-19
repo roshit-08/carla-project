@@ -118,7 +118,7 @@ def main() -> int:
     parser.add_argument("--sensor-tick", type=float, default=0.05, help="IMU update interval in seconds")
     parser.add_argument("--model-path", default="artifacts/harsh_event_cnn_bundle.pth", help="Path to trained PyTorch CNN bundle")
     parser.add_argument("--min-confidence", type=float, default=0.35, help="Minimum confidence for non-safe event")
-    parser.add_argument("--consecutive-hits", type=int, default=2, help="Smoothing hits needed before event emit")
+    parser.add_argument("--consecutive-hits", type=int, default=1, help="Smoothing hits needed before event emit")
     parser.add_argument("--compass-scale", type=float, default=100.0, help="Scale factor for pseudo magnetometer from compass")
     parser.add_argument("--mag-mode", choices=["virtual3d", "compass2d"], default="virtual3d", help="Magnetometer mode")
     parser.add_argument("--mag-field-strength", type=float, default=100.0, help="Virtual Earth magnetic field strength")
@@ -128,7 +128,7 @@ def main() -> int:
     parser.add_argument("--heuristic", action="store_true", default=False, help="Enable IMU heuristic fallback for harsh events")
     parser.add_argument("--accel-threshold", type=float, default=2.0, help="Acceleration threshold (m/s^2) for sudden acceleration heuristic")
     parser.add_argument("--brake-threshold", type=float, default=-2.0, help="Acceleration threshold (m/s^2) for sudden braking heuristic")
-    parser.add_argument("--turn-threshold", type=float, default=40.0, help="Gyroscope Z threshold (deg/s) for harsh turn heuristic")
+    parser.add_argument("--turn-threshold", type=float, default=20.0, help="Gyroscope Z threshold (deg/s) for harsh turn heuristic (converted to rad/s internally)")
     parser.add_argument("--lane-change-threshold", type=float, default=2.0, help="Acceleration Y threshold (m/s^2) for lane-change heuristic")
     parser.add_argument("--invert-gyro-z", action="store_true", default=False, help="Invert gyro_z sign if CARLA yaw-rate direction differs from training data")
     parser.add_argument("--invert-acc-y", action="store_true", default=False, help="Invert acc_y sign if CARLA lateral acceleration direction differs from training data")
@@ -136,9 +136,26 @@ def main() -> int:
 
     model_path = Path(args.model_path)
     if not model_path.exists():
-        print(f"Model bundle not found: {model_path}")
-        print("Train/export first so artifacts/harsh_event_cnn_bundle.pth exists.")
-        return 1
+        # Try to resolve relative path issues automatically
+        name = model_path.name
+        alt_paths = [
+            Path("artifacts") / name,
+            Path("../artifacts") / name,
+            Path("notebooks/artifacts") / name,
+            Path("../notebooks/artifacts") / name,
+            Path("src/artifacts") / name,
+        ]
+        resolved = False
+        for alt in alt_paths:
+            if alt.exists():
+                print(f"Model path '{model_path}' not found, but successfully resolved to: {alt}")
+                model_path = alt
+                resolved = True
+                break
+        if not resolved:
+            print(f"Model bundle not found: {model_path}")
+            print(f"Please ensure you train/export the model or check the path so that '{model_path}' exists.")
+            return 1
 
     detector = RealtimeCNNHarshEventDetector(
         model_bundle_path=model_path,

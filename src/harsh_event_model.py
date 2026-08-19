@@ -442,47 +442,51 @@ import torch
 import torch.nn as nn
 
 class TimeSeriesCNN1D(nn.Module):
+    """Compact 1D-CNN with avg+max global pooling.
+    The max branch explicitly captures peak-yaw events (turns),
+    which are otherwise averaged away in avg-only pooling.
+
+    Architecture matches the trained bundle in artifacts/harsh_event_cnn_bundle.pth:
+      - 3 conv blocks: (kernel 5, 64ch) → (kernel 5, 128ch) → (kernel 3, 128ch)
+      - Global avg + max pooling → 256-dim → classifier head
+    """
+
     def __init__(self, in_features: int, n_classes: int) -> None:
         super().__init__()
         self.conv = nn.Sequential(
-            # Layer 1
-            nn.Conv1d(in_channels=in_features, out_channels=64, kernel_size=3, padding=1),
+            # Block 1 — wider kernel to capture sustained patterns
+            nn.Conv1d(in_features, 64, kernel_size=5, padding=2),
             nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            
-            # Layer 2
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.Dropout(0.3),
+
+            # Block 2
+            nn.Conv1d(64, 128, kernel_size=5, padding=2),
             nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            
-            # Layer 3
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
             nn.Dropout(0.3),
-            
-            # Layer 4
-            nn.Conv1d(256, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-        )
-        self.head = nn.Sequential(
-            nn.Linear(256, 128),
+
+            # Block 3
+            nn.Conv1d(128, 128, kernel_size=3, padding=1),
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(0.4),
+        )
+        # Global avg + max pooling concatenated → 256-dim classifier
+        self.head = nn.Sequential(
+            nn.Linear(128 * 2, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
             nn.Linear(128, n_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input shape: [B, T, F] -> Transpose to [B, F, T]
-        x = x.transpose(1, 2)
-        x = self.conv(x)
-        # Global average pooling along temporal dimension (dim 2)
-        pooled = x.mean(dim=2)
+        x = x.transpose(1, 2)           # [B, T, F] → [B, F, T]
+        x = self.conv(x)                # [B, 128, T]
+        avg_pool = x.mean(dim=2)        # [B, 128]
+        max_pool = x.max(dim=2).values  # [B, 128] — captures peak events
+        pooled   = torch.cat([avg_pool, max_pool], dim=1)  # [B, 256]
         return self.head(pooled)
 
 
@@ -491,11 +495,11 @@ class RealtimeCNNHarshEventDetector:
         self,
         model_bundle_path: str | Path,
         min_confidence: float = 0.35,
-        consecutive_hits: int = 2,
+        consecutive_hits: int = 1,
         heuristic_enabled: bool = True,
         accel_threshold: float = 2.0,
         brake_threshold: float = -2.0,
-        turn_threshold: float = 40.0,
+        turn_threshold: float = 20.0,
         lane_change_threshold: float = 2.0,
         invert_gyro_z: bool = False,
         invert_acc_y: bool = False,
@@ -528,8 +532,8 @@ class RealtimeCNNHarshEventDetector:
         self.invert_gyro_z = bool(invert_gyro_z)
         self.invert_acc_y = bool(invert_acc_y)
         
-        # Buffer needs window_size + 10 elements to compute rolling features without edge effects
-        self.history_size = self.window_size + 10
+        # Buffer exactly window_size deep — rolling features need min_periods=1 so smaller buffers work fine
+        self.history_size = self.window_size
         self.buffer: Deque[Dict[str, float]] = deque(maxlen=self.history_size)
         self._tick = 0
         self._active_label: Optional[str] = None
@@ -566,57 +570,79 @@ class RealtimeCNNHarshEventDetector:
 
     def _build_sequence_tensor(self) -> torch.Tensor:
         df = pd.DataFrame(list(self.buffer))
-        
-        # Compute engineered features
-        df['acc_mag'] = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
+
+        # ── Magnitudes ────────────────────────────────────────────────────────
+        df['acc_mag']  = np.sqrt(df['acc_x']**2 + df['acc_y']**2 + df['acc_z']**2)
         df['gyro_mag'] = np.sqrt(df['gyro_x']**2 + df['gyro_y']**2 + df['gyro_z']**2)
-        df['mag_mag'] = np.sqrt(df['mag_x']**2 + df['mag_y']**2 + df['mag_z']**2)
-        
+        df['mag_mag']  = np.sqrt(df['mag_x']**2 + df['mag_y']**2 + df['mag_z']**2)
+
+        # ── Jerk ──────────────────────────────────────────────────────────────
         for axis in ['acc_x', 'acc_y', 'acc_z']:
             df[f'{axis}_jerk'] = df[axis].diff().fillna(0.0)
-            
-        df['lat_long_ratio'] = df['acc_y'].abs() / (df['acc_x'].abs() + 1e-6)
-        df['acc_x_abs'] = df['acc_x'].abs()
-        df['acc_y_abs'] = df['acc_y'].abs()
-        df['gyro_z_abs'] = df['gyro_z'].abs()
-        
-        df['acc_lat_energy'] = df['acc_y'] ** 2
-        df['acc_long_energy'] = df['acc_x'] ** 2
-        df['gyro_yaw_energy'] = df['gyro_z'] ** 2
-        
+
+        # ── Lateral / longitudinal ratios and energy ──────────────────────────
+        df['lat_long_ratio']        = df['acc_y'].abs() / (df['acc_x'].abs() + 1e-6)
+        df['acc_x_abs']             = df['acc_x'].abs()
+        df['acc_y_abs']             = df['acc_y'].abs()
+        df['gyro_z_abs']            = df['gyro_z'].abs()
+        df['acc_lat_energy']        = df['acc_y'] ** 2
+        df['acc_long_energy']       = df['acc_x'] ** 2
+        df['gyro_yaw_energy']       = df['gyro_z'] ** 2
         df['lat_long_energy_ratio'] = df['acc_y_abs'] / (df['acc_x_abs'] + 1e-6)
-        df['turn_vs_lateral'] = df['gyro_z_abs'] / (df['acc_y_abs'] + 1e-6)
-        df['yaw_acc_corr'] = df['gyro_z'] * df['acc_y']
-        
+        df['turn_vs_lateral']       = df['gyro_z_abs'] / (df['acc_y_abs'] + 1e-6)
+        df['yaw_acc_corr']          = df['gyro_z'] * df['acc_y']
+
+        # ── Differentials ─────────────────────────────────────────────────────
         df['gyro_z_diff'] = df['gyro_z'].diff().fillna(0.0)
-        df['acc_y_diff'] = df['acc_y'].diff().fillna(0.0)
-        
-        df['gyro_z_roll_std5'] = df['gyro_z'].rolling(5, min_periods=1).std().fillna(0.0)
-        df['acc_y_roll_std5'] = df['acc_y'].rolling(5, min_periods=1).std().fillna(0.0)
-        df['acc_y_roll_mean5'] = df['acc_y'].rolling(5, min_periods=1).mean().fillna(0.0)
-        
+        df['acc_y_diff']  = df['acc_y'].diff().fillna(0.0)
+
+        # ── Rolling statistics ────────────────────────────────────────────────
+        df['gyro_z_roll_std5']  = df['gyro_z'].rolling(5, min_periods=1).std().fillna(0.0)
+        df['acc_y_roll_std5']   = df['acc_y'].rolling(5, min_periods=1).std().fillna(0.0)
+        df['acc_y_roll_mean5']  = df['acc_y'].rolling(5, min_periods=1).mean().fillna(0.0)
+
+        # ── Sign change ───────────────────────────────────────────────────────
         df['gyro_z_sign_change'] = (df['gyro_z'].shift(1) * df['gyro_z'] < 0).astype(int).fillna(0)
-        
-        df['gyro_x_abs'] = df['gyro_x'].abs()
-        df['gyro_y_abs'] = df['gyro_y'].abs()
-        df['gyro_x_energy'] = df['gyro_x'] ** 2
-        df['gyro_y_energy'] = df['gyro_y'] ** 2
+
+        # ── Roll / pitch turn features ────────────────────────────────────────
+        df['gyro_x_abs']          = df['gyro_x'].abs()
+        df['gyro_y_abs']          = df['gyro_y'].abs()
+        df['gyro_x_energy']       = df['gyro_x'] ** 2
+        df['gyro_y_energy']       = df['gyro_y'] ** 2
         df['gyro_roll_pitch_mag'] = np.sqrt(df['gyro_x']**2 + df['gyro_y']**2)
-        df['gyro_total_mag'] = np.sqrt(df['gyro_x']**2 + df['gyro_y']**2 + df['gyro_z']**2)
-        df['yaw_vs_roll_pitch'] = df['gyro_z_abs'] / (df['gyro_roll_pitch_mag'] + 1e-6)
-        df['gyro_x_roll_std5'] = df['gyro_x'].rolling(5, min_periods=1).std().fillna(0.0)
-        df['gyro_y_roll_std5'] = df['gyro_y'].rolling(5, min_periods=1).std().fillna(0.0)
-        
-        # Slices the last window_size (25) steps of computed features
+        df['gyro_total_mag']      = np.sqrt(df['gyro_x']**2 + df['gyro_y']**2 + df['gyro_z']**2)
+        df['yaw_vs_roll_pitch']   = df['gyro_z_abs'] / (df['gyro_roll_pitch_mag'] + 1e-6)
+        df['gyro_x_roll_std5']    = df['gyro_x'].rolling(5, min_periods=1).std().fillna(0.0)
+        df['gyro_y_roll_std5']    = df['gyro_y'].rolling(5, min_periods=1).std().fillna(0.0)
+
+        # ── Peak yaw features ─────────────────────────────────────────────────
+        df['gyro_z_roll_max5']    = df['gyro_z_abs'].rolling(5,  min_periods=1).max().fillna(0.0)
+        df['gyro_z_roll_max10']   = df['gyro_z_abs'].rolling(10, min_periods=1).max().fillna(0.0)
+        df['gyro_z_roll_energy5'] = df['gyro_yaw_energy'].rolling(5, min_periods=1).mean().fillna(0.0)
+        df['yaw_dominance']       = df['gyro_z_abs'] / (df['gyro_total_mag'] + 1e-6)
+
+        # ── NEW S-CURVE & NET YAW FEATURES FOR LANE CHANGE DISCRIMINATION ─────────
+        # Net Yaw Change (cumsum over window): turns accumulate large net angle, lane changes sum to ~0
+        df['net_yaw_cumsum20']      = df['gyro_z'].rolling(20, min_periods=1).sum().fillna(0.0)
+        # Biphasic Yaw Signature: rolling min * rolling max (negative when S-curve steering left then right occurs)
+        gyro_z_min20                = df['gyro_z'].rolling(20, min_periods=1).min().fillna(0.0)
+        gyro_z_max20                = df['gyro_z'].rolling(20, min_periods=1).max().fillna(0.0)
+        df['biphasic_yaw_signature'] = gyro_z_min20 * gyro_z_max20
+        # Lateral Jerk Standard Deviation
+        df['acc_y_jerk_std5']       = df['acc_y_jerk'].rolling(5, min_periods=1).std().fillna(0.0)
+
+        # Slices the last window_size steps and selects exactly the feature
+        # columns stored in the bundle (handles old vs new bundles gracefully)
         df_sliced = df.iloc[-self.window_size:]
         values = df_sliced[self.feature_cols_stream].to_numpy(dtype=np.float32)
-        
-        # Scale values using StandardScaler
+
+        # Scale values using StandardScaler fitted at training time
         scaled_values = self.scaler.transform(values)
-        
-        # Convert to Tensor [1, window_size, 40]
+
+        # Convert to Tensor [1, window_size, n_features]
         tensor = torch.tensor(scaled_values, dtype=torch.float32).unsqueeze(0)
         return tensor
+
 
     def update(self, sample: Dict[str, float]) -> Optional[Dict[str, object]]:
         cleaned = {}

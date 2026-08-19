@@ -134,9 +134,26 @@ def main() -> int:
 
     model_path = Path(args.model_path)
     if not model_path.exists():
-        print(f"Model bundle not found: {model_path}")
-        print("Train/export first so artifacts/harsh_event_rf.joblib exists.")
-        return 1
+        # Try to resolve relative path issues automatically
+        name = model_path.name
+        alt_paths = [
+            Path("artifacts") / name,
+            Path("../artifacts") / name,
+            Path("notebooks/artifacts") / name,
+            Path("../notebooks/artifacts") / name,
+            Path("src/artifacts") / name,
+        ]
+        resolved = False
+        for alt in alt_paths:
+            if alt.exists():
+                print(f"Model path '{model_path}' not found, but successfully resolved to: {alt}")
+                model_path = alt
+                resolved = True
+                break
+        if not resolved:
+            print(f"Model bundle not found: {model_path}")
+            print(f"Please ensure you train/export the model or check the path so that '{model_path}' exists.")
+            return 1
 
     detector = RealtimeHarshEventDetector(
         model_bundle_path=model_path,
