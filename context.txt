@@ -1,0 +1,69 @@
+Project Overview: Real-Time Harsh Driving Event Detection System
+
+1. Executive Summary & Problem Statement
+The goal of this project is to build a high-precision, low-latency machine learning system for real-time harsh driving detection using 6-axis Inertial Measurement Unit (IMU) sensor time-series data (3-axis accelerometer + 3-axis gyroscope). The system is trained on labeled drive logs and evaluated in real-time within the CARLA Autonomous Driving Simulator (v0.9.13).
+
+Target Classes (7 Multi-class Labels):
+safe (Normal driving)
+harsh_left_lane_change
+harsh_right_lane_change
+harsh_left_turn
+harsh_right_turn
+sudden_acceleration
+sudden_braking
+
+2. Key Challenges Solved
+
+A. Magnetometer Removal & Domain Shift Elimination
+Problem: Early models included 3-axis magnetometer readings (mag_x, mag_y, mag_z, mag_mag). Real-world smartphone compass sensors report magnetic field strength in microteslas ($\mu T$), whereas the CARLA simulator outputs synthetic compass angles or non-standard scales. This created a massive domain gap and model failure during CARLA deployment.
+Solution: Completely removed all magnetometer features from feature engineering, training, and real-time inference pipelines.
+B. High Class Imbalance
+The dataset is heavily dominated by safe driving (safe samples outweigh harsh events by a ratio of $\sim 38:1$).
+Solution: Applied RandomOverSampler / SMOTE on training splits and incorporated class_weight='balanced' in loss functions and tree model training.
+C. Data Leakage & Evaluation Drift
+Solution: Implemented a locked file-grouped manifest (artifacts/split_manifest.csv). All windowed dataset splits (Train/Validation/Test) maintain non-overlapping source drive files to guarantee unbiased test benchmarking across all models.
+
+
+3. Feature Engineering Architecture (v2 Pipeline - 43 Channels)
+The raw sensor input consists of 6 base IMU channels (acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z). From these, 37 derived row-level channels were constructed (43 channels total):
+
+Sensor Magnitudes & Jerk:
+acc_mag, gyro_mag
+3-axis jerk: acc_x_jerk, acc_y_jerk, acc_z_jerk (.diff() per file)
+Lateral vs. Longitudinal Ratios & Energy:
+lat_long_ratio = |acc_y| / (|acc_x| + 1e-6)
+acc_lat_energy = acc_y², acc_long_energy = acc_x², gyro_yaw_energy = gyro_z²
+turn_vs_lateral = |gyro_z| / (|acc_y| + 1e-6)
+yaw_acc_corr = gyro_z * acc_y
+S-Curve & Net Yaw Features (Turn vs. Lane Change Discrimination):
+net_yaw_cumsum20: Rolling 20-sample sum of gyro_z. $90^\circ$ turns accumulate large continuous net yaw angles ($45^\circ\text{ to }90^\circ$), whereas lane changes net to $\approx 0^\circ$ (left steer + right steer cancel out).
+biphasic_yaw_signature: rolling_min(gyro_z, 20) * rolling_max(gyro_z, 20). Negative ($<0$) for lane changes due to steering reversal; non-negative ($\ge 0$) for unidirectional turns.
+acc_y_jerk_std5: Rolling standard deviation of lateral jerk capturing lateral snap during rapid maneuvers.
+Window Statistics (Tabular Models):
+Window size = 25 samples (1.25 seconds @ 20 Hz sensor tick).
+Step size = 5 samples (0.25s overlap).
+Minimum event ratio = 30% (threshold for labeling window as event vs. safe).
+For XGBoost and Random Forest, 28 statistical summary stats (mean, std, min, max, skew, kurtosis, ZCR, RMS, energy, cross-correlations) are calculated across all 43 feature channels, resulting in 1,200+ features per window.
+
+4. Models Implemented & Evaluated
+
+1. 1D-CNN (PyTorch Pipeline)
+Architecture: 3-block 1D Convolutional Neural Network with Conv1D $\to$ BatchNorm $\to$ ReLU $\to$ Combined AvgPool1D + MaxPool1D $\to$ Dropout (0.3) $\to$ Linear Classifier.
+Bundle Format: Saved PyTorch .pth bundle containing weights, scaler parameters, and metadata.
+2. XGBoost v2 (xgboost_harsh_driving_v2.ipynb)
+Optimization: Optuna Hyperparameter Study (15 trials optimizing Macro F1).
+Bundle Format: Exported Joblib .joblib bundle (harsh_event_xgb_v2.joblib).
+3. Random Forest v2 (random_forest_harsh_driving_v2.ipynb)
+Optimization: Optuna Hyperparameter Study tuning n_estimators, max_depth, min_samples_split, min_samples_leaf, and max_features with class_weight='balanced'.
+Performance: Test Accuracy: 77.49%, Test Macro F1: 0.6089.
+Bundle Format: Exported Joblib .joblib bundle (harsh_event_rf_v2.joblib).
+
+5. CARLA Simulator Real-Time Deployment Architecture
+
+Inference Scripts: src/run_carla_realtime.py (for XGBoost & Random Forest) and src/run_carla_realtime_cnn.py (for 1D-CNN).
+Sensor Tick: 0.05 seconds (20 Hz stream from hero vehicle IMU sensor).
+Post-Processing Heuristics:
+Rolling 25-sample sliding window queue inside RealtimeHarshEventDetector.
+min-confidence thresholding (default: 0.40).
+consecutive-hits heuristic (default: 2) to eliminate transient false positive flickers.
+Joblib Bundle Keys: Model bundle .joblib contains model instance, label encoder, feature_columns list, imu_columns list (['acc_x', 'acc_y', 'acc_z', 'gyro_x', 'gyro_y', 'gyro_z']), and window_size.
