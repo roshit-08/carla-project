@@ -20,7 +20,8 @@ cd /home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/examples
 python3 manual_control.py
 ```
 
-terminal 3
+##  manual driving - only Random forest
+terminal 3      
 ```bash
 export PYTHONPATH=$PYTHONPATH:/home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/carla/dist/carla-0.9.13-py3.7-linux-x86_64.egg && python3 src/run_carla_realtime.py --model-path artifacts/harsh_event_rf.joblib --mag-mode virtual3d --mag-field-strength 100 --mag-declination-deg 0 --mag-inclination-deg 60 --heuristic --print-safe --min-confidence 0.20 --consecutive-hits 1 --sensor-tick 0.02
 ```
@@ -71,6 +72,24 @@ python3 src/run_carla_realtime.py \
   --print-safe \
   --min-confidence 0.40 \
   --consecutive-hits 2 \
+  --sensor-tick 0.05
+```
+
+## Multi-Model Ensemble Live Event Detection (Without Safety Score)
+##        - Manual drive
+
+```bash
+export PYTHONPATH=$PYTHONPATH:/home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/carla/dist/carla-0.9.13-py3.7-linux-x86_64.egg
+
+python3 src/run_carla_realtime_detection.py \
+  --rf-path notebooks/artifacts/harsh_event_rf_v2.joblib \
+  --xgb-path notebooks/artifacts/harsh_event_xgb_v2.joblib \
+  --cnn-path artifacts/harsh_event_cnn_bundle.pth \
+  --rf-weight 0.40 \
+  --xgb-weight 0.30 \
+  --cnn-weight 0.30 \
+  --min-confidence 0.40 \
+  --consecutive-hits 1 \
   --sensor-tick 0.05
 ```
 
@@ -125,7 +144,7 @@ python3 src/run_carla_automated_scenario_old.py \
   --repeat-events 1
 
 
-## Just Lane change auto driving
+## Just Lane change auto driving (Real-time Event Detection)
 
 ```bash
 export PYTHONPATH=$PYTHONPATH:/home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/carla/dist/carla-0.9.13-py3.7-linux-x86_64.egg
@@ -138,8 +157,7 @@ python3 src/run_carla_lane_change_scenario.py \
   --xgb-weight 0.45 \
   --cnn-weight 0.00 \
   --min-confidence 0.50 \
-  --consecutive-hits 2 \
-  --recovery-rate 0.70 \
+  --consecutive-hits 1 \
   --scenario-interval 20.0 \
   --sensor-tick 0.05 \
   --tm-port 8000 \
