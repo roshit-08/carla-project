@@ -19,6 +19,10 @@ terminal 2
 cd /home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/examples
 python3 manual_control.py
 ```
+## updated manual_control.py
+```bash
+python3 manual_control.py
+```
 
 terminal 2.5  (for traffic)
 ### NPC Traffic (Optional - Spawn other vehicles)
