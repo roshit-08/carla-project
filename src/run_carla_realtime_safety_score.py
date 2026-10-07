@@ -37,7 +37,8 @@ def parse_args():
     parser.add_argument("--cnn-weight", type=float, default=0.30, help="CNN ensemble weight")
     parser.add_argument("--min-confidence", type=float, default=0.40, help="Minimum prediction confidence")
     parser.add_argument("--consecutive-hits", type=int, default=2, help="Consecutive hit thresholding")
-    parser.add_argument("--recovery-rate", type=float, default=0.10, help="Safety score recovery points per second of safe driving (default: 0.10 = +1pt / 10s)")
+    parser.add_argument("--recovery-rate", type=float, default=0.25, help="Safety score recovery points per second of safe driving (default: 0.25 = +1pt / 4s)")
+    parser.add_argument("--cooldown", type=float, default=1.5, help="Cooldown in seconds between consecutive penalty deductions (default: 1.5s)")
     parser.add_argument("--print-safe", action="store_true", help="Print safe ticks")
     return parser.parse_args()
 
@@ -77,7 +78,11 @@ def main():
         consecutive_hits=args.consecutive_hits,
         use_heuristics=True,
     )
-    scorer = DriverSafetyScorer(initial_score=100.0, recovery_rate_per_sec=args.recovery_rate)
+    scorer = DriverSafetyScorer(
+        initial_score=100.0,
+        recovery_rate_per_sec=args.recovery_rate,
+        cooldown_sec=args.cooldown,
+    )
 
 
     lock = threading.Lock()
@@ -91,9 +96,11 @@ def main():
 
     print("\n" + "=" * 60)
     print("      CARLA REAL-TIME DRIVER SAFETY SCORING DASHBOARD")
-    print("=" * 60)
+    print("=======================================================")
     print("Ensemble Models Loaded : Random Forest v2, XGBoost v2, 1D-CNN")
     print("Base Safety Score      : 100.0 / 100.0")
+    print(f"Recovery Rate          : +{args.recovery_rate:.2f} pt/s (+1 pt / {1.0/max(args.recovery_rate, 1e-3):.1f}s)")
+    print(f"Event Cooldown         : {args.cooldown:.1f}s")
     print("Listening to live IMU stream. Press Ctrl+C to stop.\n")
 
     def _on_imu(data: carla.IMUMeasurement):
@@ -114,7 +121,7 @@ def main():
             label = res["prediction"]
             conf = res["confidence"]
 
-            score_info = scorer.update(label, conf, dt_sec=args.sensor_tick)
+            score_info = scorer.update(label, conf, dt_sec=args.sensor_tick, imu_packet=packet)
 
             score = score_info["score"]
             tier = score_info["risk_tier"]
@@ -125,10 +132,16 @@ def main():
                 rf_p = res.get("rf_prediction", "N/A")
                 xgb_p = res.get("xgb_prediction", "N/A")
                 cnn_p = res.get("cnn_prediction", "N/A")
+                last_pen = score_info.get("last_penalty", 0.0)
+                pen_str = (
+                    f"[-{last_pen:.1f}pt (x{score_info.get('confidence_factor', 1.0):.2f}c, x{score_info.get('severity_factor', 1.0):.2f}s)]"
+                    if last_pen > 0
+                    else ""
+                )
 
                 print(
                     f"[{timestamp}] Score: {score:5.1f}/100 | Tier: {tier:<22} | Event: {label:<24} "
-                    f"(Conf: {conf:.2f} | RF:{rf_p} XGB:{xgb_p} CNN:{cnn_p}) | Events: {total_ev}"
+                    f"(Conf: {conf:.2f} | RF:{rf_p} XGB:{xgb_p} CNN:{cnn_p}) {pen_str} | Events: {total_ev}"
                 )
 
     imu_sensor.listen(_on_imu)

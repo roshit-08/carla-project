@@ -194,7 +194,7 @@ def main():
 
             label = res["prediction"]
             conf = res["confidence"]
-            score_info = scorer.update(label, conf, dt_sec=args.sensor_tick)
+            score_info = scorer.update(label, conf, dt_sec=args.sensor_tick, imu_packet=packet)
 
             score = score_info["score"]
             tier = score_info["risk_tier"]

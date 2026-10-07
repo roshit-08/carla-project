@@ -747,40 +747,145 @@ class RealtimeCNNHarshEventDetector:
 
 
 class DriverSafetyScorer:
-    """Real-time driver safety score calculator (0 - 100)."""
+    """Real-time driver safety score calculator (0 - 100) with confidence and severity scaling."""
 
-    PENALTIES = {
-        "sudden_braking": 6.0,
+    BASE_PENALTIES = {
+        "sudden_braking": 3.0,
         "harsh_left_turn": 5.0,
         "harsh_right_turn": 5.0,
         "harsh_left_lane_change": 4.0,
         "harsh_right_lane_change": 4.0,
-        "sudden_acceleration": 3.0,
+        "sudden_acceleration": 2.0,
     }
+    # Backward compatibility alias
+    PENALTIES = BASE_PENALTIES
 
-    def __init__(self, initial_score: float = 100.0, recovery_rate_per_sec: float = 1.0 / 10.0):
+    def __init__(
+        self,
+        initial_score: float = 100.0,
+        recovery_rate_per_sec: float = 0.25,
+        cooldown_sec: float = 1.5,
+    ):
         self.initial_score = initial_score
         self.current_score = initial_score
-        self.recovery_rate_per_sec = recovery_rate_per_sec  # +1.0 pt per 10 sec of safe driving
+        self.recovery_rate_per_sec = recovery_rate_per_sec  # default: +1.0 pt per 4 sec of safe driving
+        self.cooldown_sec = cooldown_sec                    # minimum seconds between penalty deductions
 
-        self.event_counts = {lbl: 0 for lbl in self.PENALTIES.keys()}
+        self.event_counts = {lbl: 0 for lbl in self.BASE_PENALTIES.keys()}
         self.total_samples = 0
         self.consecutive_safe_samples = 0
         self.start_time = time.time()
         self.last_event = "safe"
-        self.last_event_time = 0.0
+        self.last_event_time = -999.0
+        self.last_penalty_applied = 0.0
 
-    def update(self, detected_label: str, confidence: float, dt_sec: float = 0.05) -> dict:
+    def _compute_confidence_factor(self, confidence: float) -> float:
+        """
+        Confidence-Weighted Penalty Scaling (Part A):
+        - Ambiguous prediction (0.40 <= conf < 0.60): 50% penalty
+        - Moderate prediction (0.60 <= conf < 0.70): 75% penalty
+        - High confidence (conf >= 0.70): 100% full penalty
+        """
+        if confidence < 0.60:
+            return 0.50
+        elif confidence < 0.70:
+            return 0.75
+        else:
+            return 1.00
+
+    def _compute_severity_factor(self, label: str, imu_packet: Optional[dict] = None) -> float:
+        """
+        Severity-Scaled Deduction based on IMU G-Force and Yaw Rate (Part B):
+        - Mild braking (3.0 <= |acc_x| < 5.0 m/s^2): base deduction scaled to ~2.0 pts (factor ~0.67)
+        - Severe braking (|acc_x| >= 5.0 m/s^2): multiplied deduction 4.0 - 6.0 pts (factor 1.33 - 2.0)
+        - Also scales sudden acceleration, harsh turns (yaw rate), and lane changes (lat acc).
+        """
+        if not imu_packet:
+            return 1.0
+
+        acc_x = float(imu_packet.get("acc_x", 0.0))
+        acc_y = float(imu_packet.get("acc_y", 0.0))
+        gyro_z = float(imu_packet.get("gyro_z", 0.0))
+
+        if label == "sudden_braking":
+            decel = abs(acc_x)
+            if decel < 5.0:
+                # Mild braking: scaled to ~2.0 pts base (2.0 / 3.0 = 0.67)
+                return 0.67
+            elif decel < 7.0:
+                # Moderate braking: 1.0 multiplier (3.0 pts base)
+                return 1.00
+            else:
+                # Severe braking (> 7.0 m/s^2): scaled up to 4.5 - 6.0 pts
+                return min(2.0, 1.33 + (decel - 7.0) * 0.25)
+
+        elif label == "sudden_acceleration":
+            accel = abs(acc_x)
+            if accel < 4.2:
+                # Mild acceleration: ~1.2 pts (0.60 * 2.0)
+                return 0.60
+            elif accel < 5.5:
+                return 1.00
+            else:
+                # Severe acceleration (> 5.5 m/s^2): ~2.5 - 3.0 pts
+                return 1.40
+
+        elif label in ("harsh_left_turn", "harsh_right_turn"):
+            yaw_rate = abs(gyro_z)
+            if yaw_rate < 0.55:
+                # Mild turn (~3.5 pts)
+                return 0.70
+            elif yaw_rate < 0.85:
+                return 1.00
+            else:
+                # Severe turn (> 0.85 rad/s: ~6.5 - 7.5 pts)
+                return min(1.5, 1.00 + (yaw_rate - 0.85) * 0.8)
+
+        elif label in ("harsh_left_lane_change", "harsh_right_lane_change"):
+            lat_acc = abs(acc_y)
+            if lat_acc < 3.2:
+                # Mild lane change (~3.0 pts)
+                return 0.75
+            elif lat_acc < 4.8:
+                return 1.00
+            else:
+                # Severe lane change (> 4.8 m/s^2: ~5.5 pts)
+                return 1.35
+
+        return 1.00
+
+    def update(
+        self,
+        detected_label: str,
+        confidence: float,
+        dt_sec: float = 0.05,
+        imu_packet: Optional[dict] = None,
+    ) -> dict:
         self.total_samples += 1
         trip_duration = time.time() - self.start_time
 
-        if detected_label in self.PENALTIES and detected_label != self.last_event:
-            penalty = self.PENALTIES[detected_label]
-            self.current_score = max(0.0, self.current_score - penalty)
-            self.event_counts[detected_label] += 1
-            self.consecutive_safe_samples = 0
-            self.last_event = detected_label
-            self.last_event_time = trip_duration
+        applied_penalty = 0.0
+        severity_factor = 1.0
+        conf_factor = 1.0
+
+        if detected_label in self.BASE_PENALTIES:
+            time_since_last_event = trip_duration - self.last_event_time
+            is_new_event = (detected_label != self.last_event) or (time_since_last_event >= self.cooldown_sec)
+
+            # Deduct points if it's a new event or cooldown has passed
+            if is_new_event and time_since_last_event >= self.cooldown_sec:
+                base_pen = self.BASE_PENALTIES[detected_label]
+                conf_factor = self._compute_confidence_factor(confidence)
+                severity_factor = self._compute_severity_factor(detected_label, imu_packet)
+
+                applied_penalty = round(base_pen * conf_factor * severity_factor, 2)
+                self.current_score = max(0.0, self.current_score - applied_penalty)
+                self.event_counts[detected_label] += 1
+                self.consecutive_safe_samples = 0
+                self.last_event = detected_label
+                self.last_event_time = trip_duration
+                self.last_penalty_applied = applied_penalty
+
         elif detected_label == "safe":
             self.consecutive_safe_samples += 1
             # Add safe recovery bonus
@@ -790,10 +895,10 @@ class DriverSafetyScorer:
                 self.last_event = "safe"
 
         # Risk Rating Tier
-        if self.current_score >= 90.0:
+        if self.current_score >= 80.0:
             risk_tier = "SAFE / SMOOTH"
             color_code = "GREEN"
-        elif self.current_score >= 75.0:
+        elif self.current_score >= 65.0:
             risk_tier = "MODERATE RISK"
             color_code = "YELLOW"
         else:
@@ -807,6 +912,9 @@ class DriverSafetyScorer:
             "total_events": sum(self.event_counts.values()),
             "event_counts": self.event_counts.copy(),
             "trip_duration_sec": round(trip_duration, 1),
+            "last_penalty": applied_penalty,
+            "confidence_factor": conf_factor,
+            "severity_factor": severity_factor,
         }
 
 
