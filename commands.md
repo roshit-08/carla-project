@@ -20,6 +20,19 @@ cd /home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/examples
 python3 manual_control.py
 ```
 
+terminal 2.5  (for traffic)
+### NPC Traffic (Optional - Spawn other vehicles)
+Run in a separate terminal to populate the town with autopilot vehicles:
+```bash
+# Option A: Using the workspace script
+python3 scripts/spawn_traffic.py -n 30 --safe
+
+# Option B: Using CARLA's built-in script (note: must use --asynch so manual_control doesn't stutter)
+cd /home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/examples
+python3 generate_traffic.py -n 30 -w 0 --asynch --safe
+```
+
+
 ##  manual driving - only Random forest
 terminal 3      
 ```bash
@@ -80,7 +93,6 @@ python3 src/run_carla_realtime.py \
 
 ```bash
 export PYTHONPATH=$PYTHONPATH:/home/nikhil/Downloads/CARLA_0.9.13/PythonAPI/carla/dist/carla-0.9.13-py3.7-linux-x86_64.egg
-
 python3 src/run_carla_realtime_detection.py \
   --rf-path notebooks/artifacts/harsh_event_rf_v2.joblib \
   --xgb-path notebooks/artifacts/harsh_event_xgb_v2.joblib \
@@ -106,8 +118,8 @@ python3 src/run_carla_realtime_safety_score.py \
   --xgb-weight 0.30 \
   --cnn-weight 0.30 \
   --min-confidence 0.40 \
-  --consecutive-hits 2 \
-  --sensor-tick 0.08
+  --consecutive-hits 1 \
+  --sensor-tick 0.05
 ```
 ## Automated Scenario Benchmark (Autopilot + Scripted Harsh Events)
 
